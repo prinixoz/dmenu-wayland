@@ -1,0 +1,5 @@
+# Meson/Ninja build artifacts and generated files
+build/
+
+# Local cache directory
+.cache/
