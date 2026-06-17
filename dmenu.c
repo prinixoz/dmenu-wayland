@@ -1,4 +1,4 @@
-/* Se&& count>0e LICENSE file for copyright and license details. */
+/* See LICENSE file for copyright and license details. */
 #include "draw.h"
 #include <bits/stdint-intn.h>
 #include <ctype.h>
@@ -23,6 +23,7 @@ struct Item {
   Item *next;         /* traverses all items */
   Item *left, *right; /* traverses matching items */
   int32_t width;
+  int score;
 };
 
 typedef enum { LEFT, RIGHT, CENTRE } TextPosition;
@@ -50,10 +51,11 @@ static uint32_t color_selected_bg = 0x924441ff;
 static uint32_t color_selected_fg = 0xeeeeeeff;
 
 static int32_t line_height = 25;
+static int prompt_width = 0;
 
 char *get_clipboard_text(void);
 static void appenditem(Item *item, Item **list, Item **last);
-static char *fstrstr(const char *s, const char *sub);
+static int fuzzy_match(const char *text, const char *pattern);
 static void insert(const char *s, ssize_t n, struct dmenu_panel *panel);
 static void match(struct dmenu_panel *panel);
 static size_t nextrune(int incr);
@@ -87,7 +89,7 @@ static Item *matches, *sel;
 static Item *prev, *curr, *next;
 static Item *leftmost, *rightmost;
 static char *font = "Hack 11";
-static int font_size = 14; // default size in pt (adjust as needed)
+static int font_size = 14;
 int noOfMatch = 0;
 int currentposition = 0;
 
@@ -133,25 +135,21 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       char *texts = get_clipboard_text();
       if (texts) {
         size_t len_texts = strlen(texts);
-        size_t current_len = strlen(text_);
+        size_t current_len = strlen(text);
 
-        // Check if there's room to append
         if (current_len + len_texts < BUFSIZ) {
-          // Append to both text and text_
           strncat(text, texts, BUFSIZ - current_len - 1);
-          strncat(text_, texts, BUFSIZ - current_len - 1);
         } else {
           fprintf(stderr, "⚠️ Not enough space in buffer to append full "
                           "clipboard text. Truncating.\n");
-
-          // Append as much as we can
           size_t space_left = BUFSIZ - current_len - 1;
           strncat(text, texts, space_left);
-          strncat(text_, texts, space_left);
         }
 
-        // Update cursor to the new end of the text
-        cursor = strlen(text_);
+        cursor = strlen(text);
+
+        match(panel);
+        dmenu_draw(panel);
 
         free(texts);
         sym = XKB_KEY_NoSymbol;
@@ -194,40 +192,79 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
     break;
 
   case XKB_KEY_Up:
-    if ((currentposition - 1) >= 0) {
-      currentposition--;
-      sel = sel->left;
+    if (lines > 0) {
+      if (sel && sel->left) {
+        currentposition--;
+        sel = sel->left;
+      }
+    } else {
+      if (sel && sel->left) {
+        currentposition--;
+        sel = sel->left;
+      }
     }
     break;
   case XKB_KEY_Left:
-    if (cursor && (!sel || !sel->left)) {
-      cursor = nextrune(-1);
-    }
-    if (sel && sel->left && (currentposition - lines) >= 0) {
-      for (int i = 0; i < lines; i++) {
-        sel = sel->left;
+    if (lines > 0) {
+      if (sel) {
+        Item *t_item = sel;
+        int steps = 0;
+        // Move exact column widths back relative to vertical list height
+        // constraints
+        while (steps < lines && t_item->left) {
+          t_item = t_item->left;
+          steps++;
+        }
+        if (steps > 0) {
+          sel = t_item;
+          currentposition -= steps;
+        }
+      }
+    } else {
+      if (sel && sel->left) {
         currentposition--;
+        sel = sel->left;
+      } else if (cursor > 0) {
+        cursor = nextrune(-1);
       }
     }
     break;
 
   case XKB_KEY_Down:
-    if ((currentposition + 1) <= noOfMatch &&
-        (currentposition + 1) < (lines * gridn)) {
-      currentposition++;
-      sel = sel->right;
+    if (lines > 0) {
+      if (sel && sel->right) {
+        currentposition++;
+        sel = sel->right;
+      }
+    } else {
+      if (sel && sel->right) {
+        currentposition++;
+        sel = sel->right;
+      }
     }
     break;
   case XKB_KEY_Right:
-    if (cursor < len) {
-      cursor = nextrune(+1);
-    } else if (cursor == len) {
-      if (sel && sel->right && (currentposition + lines) <= noOfMatch &&
-          (currentposition + lines) < (lines * gridn)) {
-        for (int i = 0; i < lines; i++) {
-          sel = sel->right;
-          currentposition++;
+    if (lines > 0) {
+      if (sel) {
+        Item *t_item = sel;
+        int steps = 0;
+        // Move exact column widths forward relative to vertical list height
+        // constraints
+        while (steps < lines && t_item->right) {
+          t_item = t_item->right;
+          steps++;
         }
+        if (steps > 0) {
+          sel = t_item;
+          currentposition += steps;
+        }
+      }
+    } else {
+      if (cursor < len) {
+        cursor = nextrune(+1);
+      } else if (sel && sel->right) {
+        currentposition++;
+        sel = sel->right;
       }
     }
     break;
@@ -236,8 +273,10 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       cursor = len;
       break;
     }
-    while (sel && sel->right)
+    while (sel && sel->right) {
       sel = sel->right;
+      currentposition++;
+    }
     break;
 
   case XKB_KEY_Home:
@@ -246,7 +285,7 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       break;
     }
     sel = curr = matches;
-    /* calcoffsets(); */
+    currentposition = 0;
     break;
 
   case XKB_KEY_BackSpace:
@@ -296,26 +335,20 @@ void draw_text(cairo_t *cairo, int32_t width, int32_t height, const char *str,
 
   int32_t text_y = (height * scale - text_height) / 2.0 + *y;
 
-  if (*x + padding * scale + text_width + 30 * scale > width) {
-    cairo_move_to(cairo, width, text_y);
-    pango_printf(cairo, font, scale, false, ">");
-  } else {
-    if (background_color) {
-      cairo_set_source_u32(cairo, background_color);
-      cairo_rectangle(cairo, *x, *y,
-                      (lines ? width / gridn : text_width + 2 * padding) *
-                          scale,
-                      height * scale); // select rectangle here
-      grid_width =
-          (lines ? (width - *x) / gridn : text_width + 2 * padding) * scale;
-      cairo_fill(cairo);
-    }
-
-    cairo_move_to(cairo, *x + padding * scale, text_y);
-    cairo_set_source_u32(cairo, foreground_color);
-
-    pango_printf(cairo, font, scale, false, str);
+  if (background_color) {
+    cairo_set_source_u32(cairo, background_color);
+    cairo_rectangle(cairo, *x, *y,
+                    (lines ? width / gridn : text_width + 2 * padding) * scale,
+                    height * scale);
+    grid_width =
+        (lines ? (width - *x) / gridn : text_width + 2 * padding) * scale;
+    cairo_fill(cairo);
   }
+
+  cairo_move_to(cairo, *x + padding * scale, text_y);
+  cairo_set_source_u32(cairo, foreground_color);
+
+  pango_printf(cairo, font, scale, false, str);
 
   *new_x += text_width + 2 * padding * scale;
   *new_y += height * scale;
@@ -326,7 +359,6 @@ void draw(cairo_t *cairo, int32_t width, int32_t height, int32_t scale) {
   int32_t y = 0;
   int32_t bin;
 
-  int prompt_width;
   int32_t item_padding = 10;
   int32_t text_width, text_height;
 
@@ -342,11 +374,13 @@ void draw(cairo_t *cairo, int32_t width, int32_t height, int32_t scale) {
     draw_text(cairo, width, line_height, prompt, &x, &y, &x, &bin, scale,
               color_prompt_fg, color_prompt_bg, 6);
     prompt_width = x;
-
     window_config.input_field = x;
   } else {
+    prompt_width = 0;
     window_config.input_field = 0;
   }
+
+  int text_input_x = prompt_width;
 
   cairo_set_source_u32(cairo, color_input_bg);
   cairo_rectangle(cairo, window_config.input_field, 0,
@@ -356,80 +390,177 @@ void draw(cairo_t *cairo, int32_t width, int32_t height, int32_t scale) {
   memset(text_, 0, BUFSIZ);
 
   if (password) {
-    memset(text_, '*', strlen(text)); // TODO
-    text_[strlen(text)] = '\0';
+    size_t char_count = 0;
+    for (size_t i = 0; text[i] != '\0'; i++) {
+      if ((text[i] & 0xC0) != 0x80)
+        char_count++;
+    }
+    size_t p_len = MIN(char_count, BUFSIZ - 1);
+    memset(text_, '*', p_len);
+    text_[p_len] = '\0';
   } else {
     strncpy(text_, text, cursor);
+    text_[cursor] = '\0';
   }
 
-  // draw input
-  // depending on orientation add heigth of input to y
-  draw_text(cairo, width, line_height, (password) ? text_ : text, &x, &y, &bin,
-            (lines ? &y : &bin), scale, color_input_fg, 0, 6);
+  int draw_input_x = text_input_x;
+  draw_text(cairo, width, line_height, (password) ? text_ : text, &draw_input_x,
+            &y, &bin, (lines ? &y : &bin), scale, color_input_fg, 0, 6);
 
   {
-    /* draw cursor */
     int32_t text_widths, text_heights;
     get_text_size(cairo, font, &text_widths, &text_heights, NULL, scale, false,
                   text_);
 
     int32_t padding = 6 * scale;
-    cairo_rectangle(cairo, x + padding + text_widths, text_y, 2, text_heights);
+    cairo_rectangle(cairo, text_input_x + padding + text_widths, text_y, 2,
+                    text_heights);
     cairo_fill(cairo);
   }
 
   if (!lines) {
-    x += 320 * scale;
+    x = text_input_x + 320 * scale;
   }
-  /* Scroll indicator will be drawn later if required. */
   int32_t scroll_indicator_pos = x;
 
   if (!matches) {
-    noOfMatch = 0;
     return;
   }
+
   Item *item;
   int gw = (width - prompt_width) / gridn;
-  int max_len = (gw - (item_padding * 2) - ((gridn == 1) ? 100 : 0)) /
-                (text_width / 2); // TODO
+  int max_len =
+      (gw - (item_padding * 2) - ((gridn == 1) ? 100 : 0)) / (text_width / 2);
 
-  int i = 0;
-  for (item = matches; item; item = item->right) {
-    uint32_t bg_color = sel == item ? color_selected_bg : color_bg;
-    uint32_t fg_color = sel == item ? color_selected_fg : color_fg;
+  if (!lines) {
+    int input_box_end = x;
+    if (!curr)
+      curr = matches;
 
-    if (x >= width || y >= height)
-      break;
-
-    if (!lines) {
-      draw_text(cairo, width - 20 * scale, line_height, item->text, &x, &y, &x,
-                &bin, scale, fg_color, bg_color, item_padding);
-    } else {
-      int w, h;
-      get_text_size(cairo, "Sans Bold 12", &w, &h, NULL, 1.0, false,
-                    item->text);
-      char newtext[max_len];
-      truncate_and_ellipsis(item->text, newtext, max_len - 1);
-      if (gridn > 1) {
-        y += line_height;
-        if ((i % lines) == 0 && i > 0)
-          x += gw;
-        if ((i % lines) == 0)
-          y = line_height;
-        draw_text(cairo, width * scale, line_height, newtext, &x, &y, &bin,
-                  &bin, scale, fg_color, bg_color, item_padding);
-      } else {
-        draw_text(cairo, width * scale, line_height, newtext, &x, &y, &bin, &y,
-                  scale, fg_color, bg_color, item_padding);
+    bool sel_before_curr = false;
+    for (item = matches; item && item != curr; item = item->right) {
+      if (item == sel) {
+        sel_before_curr = true;
+        break;
       }
     }
-    i++;
-  }
-  noOfMatch = (i - 1);
+    if (sel_before_curr) {
+      curr = sel;
+    }
 
-  if (leftmost != matches) {
-    cairo_move_to(cairo, scroll_indicator_pos, text_y);
-    pango_printf(cairo, font, scale, false, "<");
+    while (curr && curr != sel) {
+      int test_x = input_box_end;
+      bool fits = false;
+      for (item = curr; item; item = item->right) {
+        int w, h;
+        get_text_size(cairo, font, &w, &h, NULL, scale, false, item->text);
+        int alloc_w = w + (item_padding * 2 * scale);
+
+        if (test_x + alloc_w > width - (15 * scale)) {
+          break;
+        }
+        if (item == sel) {
+          fits = true;
+          break;
+        }
+        test_x += alloc_w;
+      }
+      if (fits) {
+        break;
+      }
+      curr = curr->right;
+    }
+
+    if (curr != matches) {
+      cairo_move_to(cairo, scroll_indicator_pos - (15 * scale), text_y);
+      cairo_set_source_u32(cairo, color_fg);
+      pango_printf(cairo, font, scale, false, "<");
+    }
+
+    x = input_box_end;
+    for (item = curr; item; item = item->right) {
+      int w, h;
+      get_text_size(cairo, font, &w, &h, NULL, scale, false, item->text);
+      int alloc_w = w + (item_padding * 2 * scale);
+
+      if (x + alloc_w > width - (15 * scale)) {
+        cairo_move_to(cairo, width - (12 * scale), text_y);
+        cairo_set_source_u32(cairo, color_fg);
+        pango_printf(cairo, font, scale, false, ">");
+        break;
+      }
+
+      uint32_t bg_color = sel == item ? color_selected_bg : color_bg;
+      uint32_t fg_color = sel == item ? color_selected_fg : color_fg;
+
+      draw_text(cairo, width, line_height, item->text, &x, &y, &x, &bin, scale,
+                fg_color, bg_color, item_padding);
+    }
+  } else {
+    int display_capacity = lines * gridn;
+    if (!curr)
+      curr = matches;
+
+    bool sel_before_curr = false;
+    for (item = matches; item && item != curr; item = item->right) {
+      if (item == sel) {
+        sel_before_curr = true;
+        break;
+      }
+    }
+    if (sel_before_curr) {
+      curr = sel;
+    }
+
+    while (curr && curr != sel) {
+      int count = 0;
+      bool fits = false;
+      for (item = curr; item; item = item->right) {
+        if (item == sel) {
+          fits = true;
+          break;
+        }
+        if (++count >= display_capacity)
+          break;
+      }
+      if (fits)
+        break;
+      curr = curr->right;
+    }
+
+    int i = 0;
+    for (item = curr; item; item = item->right) {
+      if (i >= display_capacity)
+        break;
+
+      uint32_t bg_color = sel == item ? color_selected_bg : color_bg;
+      uint32_t fg_color = sel == item ? color_selected_fg : color_fg;
+
+      char newtext[max_len > 0 ? max_len : 1];
+      truncate_and_ellipsis(item->text, newtext, max_len > 0 ? max_len : 1);
+
+      if (gridn > 1) {
+        int col = i / lines;
+        int row = i % lines;
+        x = prompt_width + (col * gw);
+        y = (row + 1) * line_height * scale;
+
+        if (x >= width || y >= height)
+          break;
+
+        draw_text(cairo, width, line_height, newtext, &x, &y, &bin, &bin, scale,
+                  fg_color, bg_color, item_padding);
+      } else {
+        x = prompt_width; // Correct alignment padding relative to prompt width
+                          // bounds
+        y = (i + 1) * line_height * scale;
+        if (y >= height)
+          break;
+        draw_text(cairo, width, line_height, newtext, &x, &y, &bin, &bin, scale,
+                  fg_color, bg_color, item_padding);
+      }
+      i++;
+    }
   }
 }
 
@@ -444,11 +575,8 @@ uint32_t parse_color(char *str) {
   }
 
   uint32_t _val = strtol(&str[1], NULL, 16);
-
   uint32_t color = 0x000000ff;
 
-  /* Alpha specified
-   * Otherwise, assume full opacity */
   if (len == 9) {
     color = _val;
   } else {
@@ -482,10 +610,6 @@ int main(int argc, char **argv) {
       returnearly = true;
     else if (!strcmp(argv[i], "-P"))
       password = true;
-    // else if (i == argc - 1) {
-    // 	usage();
-    // }
-    /* opts that need 1 arg */
     else if (!strcmp(argv[i], "-et") || !strcmp(argv[i], "--echo-timeout"))
       timeout = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--height"))
@@ -498,7 +622,7 @@ int main(int argc, char **argv) {
       ++i;
       bool is_num = true;
 
-      for (int j = 0; j < strlen(argv[i]); ++j) {
+      for (size_t j = 0; j < strlen(argv[i]); ++j) {
         if (!isdigit(argv[i][j])) {
           is_num = false;
           break;
@@ -547,7 +671,6 @@ int main(int argc, char **argv) {
 
   int32_t panel_height = line_height;
   if (lines && items != NULL) {
-    // +1 for input
     if (itemcount < lines)
       lines = itemcount;
     panel_height *= lines + 1;
@@ -596,64 +719,118 @@ void appenditem(Item *item, Item **list, Item **last) {
   *last = item;
 }
 
-char *fstrstr(const char *s, const char *sub) {
-  size_t len;
+static int fuzzy_match(const char *text_str, const char *pattern) {
+  if (!pattern || !*pattern)
+    return 0;
 
-  for (len = strlen(sub); *s; s++) {
-    if (!fstrncmp(s, sub, len)) {
-      return (char *)s;
+  bool strict_case = (fstrncmp == strncmp);
+  int score = 0;
+  int penalty = 0;
+  const char *t = text_str;
+  const char *p = pattern;
+
+  while (*t && *p) {
+    char t_char = strict_case ? *t : tolower((unsigned char)*t);
+    char p_char = strict_case ? *p : tolower((unsigned char)*p);
+
+    if (t_char == p_char) {
+      score += 10;
+      if (t == text_str || *(t - 1) == ' ' || *(t - 1) == '-' ||
+          *(t - 1) == '_' || *(t - 1) == '/') {
+        score += 45;
+      }
+      score -= penalty;
+      penalty = 0;
+      p++;
+    } else {
+      penalty++;
     }
+    t++;
   }
 
-  return NULL;
+  return (*p == '\0') ? score : -1;
 }
 
-// TODO: find a better way than passing the panel for early return
+static int compare_items(const void *a, const void *b) {
+  Item *ia = *(Item **)a;
+  Item *ib = *(Item **)b;
+
+  if (!ia && !ib)
+    return 0;
+  if (!ia)
+    return 1;
+  if (!ib)
+    return -1;
+
+  return ib->score - ia->score;
+}
+
 void match(struct dmenu_panel *panel) {
-  size_t len;
-  Item *item, *itemend, *lexact, *lprefix, *lsubstr, *exactend, *prefixend,
-      *substrend;
+  Item *item, *last = NULL;
+  int match_count = 0;
 
-  rightmost = leftmost = NULL;
-  len = strlen(text);
-  matches = lexact = lprefix = lsubstr = itemend = exactend = prefixend =
-      substrend = NULL;
-  for (item = items; item; item = item->next)
-    if (!fstrncmp(text, item->text, len + 1)) {
-      appenditem(item, &lexact, &exactend);
-    } else if (!fstrncmp(text, item->text, len)) {
-      appenditem(item, &lprefix, &prefixend);
-    } else if (fstrstr(item->text, text)) {
-      appenditem(item, &lsubstr, &substrend);
+  matches = leftmost = rightmost = NULL;
+
+  if (text[0] == '\0') {
+    noOfMatch = 0;
+    for (item = items; item; item = item->next) {
+      item->score = 0;
+      appenditem(item, &matches, &last);
+      noOfMatch++;
     }
-
-  if (lexact) {
-    matches = lexact;
-    itemend = exactend;
+    curr = prev = next = sel = matches;
+    leftmost = matches;
+    return;
   }
-  if (lprefix) {
-    if (itemend) {
-      itemend->right = lprefix;
-      lprefix->left = itemend;
+
+  for (item = items; item; item = item->next) {
+    int base_score = fuzzy_match(item->text, text);
+    if (base_score >= 0) {
+      item->score = base_score - strlen(item->text);
+
+      if (strcasecmp(item->text, text) == 0) {
+        item->score += 10000;
+      }
+      match_count++;
     } else {
-      matches = lprefix;
+      item->score = -1;
     }
+  }
 
-    itemend = prefixend;
+  if (match_count == 0) {
+    noOfMatch = 0;
+    curr = prev = next = sel = NULL;
+    return;
   }
-  if (lsubstr) {
-    if (itemend) {
-      itemend->right = lsubstr;
-      lsubstr->left = itemend;
-    } else
-      matches = lsubstr;
+
+  Item **array = malloc(match_count * sizeof(Item *));
+  if (!array) {
+    eprintf("Allocation failed during fuzzy sort.\n");
   }
+
+  int idx = 0;
+  for (item = items; item; item = item->next) {
+    if (fuzzy_match(item->text, text) >= 0) {
+      array[idx++] = item;
+    }
+  }
+
+  qsort(array, match_count, sizeof(Item *), compare_items);
+
+  noOfMatch = 0;
+  for (int i = 0; i < match_count; i++) {
+    if (array[i]) {
+      appenditem(array[i], &matches, &last);
+      noOfMatch++;
+    }
+  }
+
+  free(array);
+
   curr = prev = next = sel = matches;
-  /* calcoffsets(); */
-
   leftmost = matches;
 
-  if (returnearly && !curr->right) {
+  if (returnearly && curr && !curr->right) {
     printf("dieter\n");
     handle_return(curr->text, panel);
   }
@@ -671,28 +848,34 @@ size_t nextrune(int incr) {
 }
 
 void readstdin(void) {
-  char buf[sizeof text], *p;
+  char *line = NULL;
+  size_t linecap = 0;
+  ssize_t linelen;
   Item *item, **end;
 
-  for (end = &items; fgets(buf, sizeof buf, stdin);
-       *end = item, end = &item->next) {
+  end = &items;
+  while ((linelen = getline(&line, &linecap, stdin)) != -1) {
     itemcount++;
 
-    if ((p = strchr(buf, '\n'))) {
-      *p = '\0';
+    if (linelen > 0 && line[linelen - 1] == '\n') {
+      line[linelen - 1] = '\0';
     }
 
     if (!(item = malloc(sizeof *item))) {
-      eprintf("cannot malloc %u bytes\n", sizeof *item);
+      eprintf("cannot malloc %zu bytes\n", sizeof *item);
     }
     item->width = -1;
+    item->score = 0;
 
-    if (!(item->text = strdup(buf))) {
-      eprintf("cannot strdup %u bytes\n", strlen(buf) + 1);
+    if (!(item->text = strdup(line))) {
+      eprintf("cannot strdup %zu bytes\n", strlen(line) + 1);
     }
 
     item->next = item->left = item->right = NULL;
+    *end = item;
+    end = &item->next;
   }
+  free(line);
 }
 
 void handle_return(char *value, struct dmenu_panel *panel) {
@@ -708,44 +891,33 @@ void usage(void) {
   printf("Display newline-separated input stdin as a menubar\n");
   printf("\n");
   printf("  -e,  --echo                       display text from stdin with no "
-         "user\n");
-  printf("                                      interaction\n");
+         "user interaction\n");
   printf("  -ec, --echo-centre                same as -e but align text "
          "centrally\n");
   printf(
       "  -er, --echo-right                 same as -e but align text right\n");
   printf("  -et, --echo-timeout SECS          close the message after SEC "
-         "seconds\n");
-  printf("                                      when using -e, -ec, or -er\n");
+         "seconds when using -e, -ec, or -er\n");
   printf("  -b,  --bottom                     dmenu appears at the bottom of "
          "the screen\n");
   printf("  -h,  --height N                   set dmenu to be N pixels high\n");
   printf("  -i,  --insensitive                dmenu matches menu items case "
-         "insensitively\n");
+         "insensitively (ON by default; flag forces sensitivity)\n");
   printf("  -l,  --lines LINES                dmenu lists items vertically, "
          "within the\n");
-  printf("  -g,  --grids N                    dmenu lists items horizontally, "
-         "within the\n");
-  printf("                                      given number of lines\n");
+  printf("  -g,  --grid N                     dmenu lists items horizontally, "
+         "within the given number of lines\n");
   printf("  -m,  --monitor MONITOR            dmenu appears on the given "
-         "Xinerama screen\n");
-  printf("                                      (does nothing on wayland, "
-         "supported for)\n");
-  printf("                                      compatibility with dmenu.\n");
+         "Xinerama screen (compatibility only)\n");
   printf("  -p,  --prompt  PROMPT             prompt to be displayed to the "
-         "left of the\n");
-  printf("                                      input field\n");
+         "left of the input field\n");
   printf("  -P,  --password                   input will be hidden\n");
   printf("  -po, --prompt-only  PROMPT        same as -p but don't wait for "
          "stdin\n");
-  printf("                                      useful for a prompt with no "
-         "menu\n");
   printf("  -r,  --return-early               return as soon as a single match "
          "is found\n");
   printf("  -fn, --font-name FONT             font or font set to be used\n");
   printf("  -nb, --normal-background COLOR    normal background color\n");
-  printf("                                      #RRGGBB and #RRGGBBAA "
-         "supported\n");
   printf("  -nf, --normal-foreground COLOR    normal foreground color\n");
   printf("  -sb, --selected-background COLOR  selected background color\n");
   printf("  -sf, --selected-foreground COLOR  selected foreground color\n");
@@ -767,8 +939,8 @@ void truncate_and_ellipsis(const char *input, char *output, size_t max_len) {
     strncpy(output, input, max_len - 1);
     output[max_len - 1] = '\0';
   } else {
-    strncpy(output, input, max_len - 4); // leave room for "..."
-    output[max_len - 4] = '\0';          // null-terminate
+    strncpy(output, input, max_len - 4);
+    output[max_len - 4] = '\0';
     strcat(output, "...");
   }
 }
@@ -780,7 +952,6 @@ char *get_clipboard_text(void) {
     return NULL;
   }
 
-  // Allocate buffer
   size_t bufsize = 8192;
   char *buffer = malloc(bufsize);
   if (!buffer) {
@@ -792,15 +963,11 @@ char *get_clipboard_text(void) {
   size_t len = 0;
   int c;
 
-  // Read from pipe until EOF or buffer full
   while ((c = fgetc(fp)) != EOF && len < bufsize - 1) {
     buffer[len++] = (char)c;
   }
   buffer[len] = '\0';
 
   pclose(fp);
-
-  // Optional: trim trailing newlines/spaces here if you want
-
   return buffer;
 }
