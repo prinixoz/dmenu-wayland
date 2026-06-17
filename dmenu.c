@@ -192,15 +192,14 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
     break;
 
   case XKB_KEY_Up:
-    if (lines > 0) {
-      if (sel && sel->left) {
-        currentposition--;
-        sel = sel->left;
-      }
-    } else {
-      if (sel && sel->left) {
-        currentposition--;
-        sel = sel->left;
+    if (sel && sel->left) {
+      currentposition--;
+      sel = sel->left;
+    } else if (matches) {
+      // Wrap around to the end of the list
+      while (sel && sel->right) {
+        sel = sel->right;
+        currentposition++;
       }
     }
     break;
@@ -209,8 +208,6 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       if (sel) {
         Item *t_item = sel;
         int steps = 0;
-        // Move exact column widths back relative to vertical list height
-        // constraints
         while (steps < lines && t_item->left) {
           t_item = t_item->left;
           steps++;
@@ -224,6 +221,12 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       if (sel && sel->left) {
         currentposition--;
         sel = sel->left;
+      } else if (matches) {
+        // Wrap around to the end of the list
+        while (sel && sel->right) {
+          sel = sel->right;
+          currentposition++;
+        }
       } else if (cursor > 0) {
         cursor = nextrune(-1);
       }
@@ -231,16 +234,13 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
     break;
 
   case XKB_KEY_Down:
-    if (lines > 0) {
-      if (sel && sel->right) {
-        currentposition++;
-        sel = sel->right;
-      }
-    } else {
-      if (sel && sel->right) {
-        currentposition++;
-        sel = sel->right;
-      }
+    if (sel && sel->right) {
+      currentposition++;
+      sel = sel->right;
+    } else if (matches) {
+      // Wrap around to the start of the list
+      sel = matches;
+      currentposition = 0;
     }
     break;
   case XKB_KEY_Right:
@@ -248,8 +248,6 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       if (sel) {
         Item *t_item = sel;
         int steps = 0;
-        // Move exact column widths forward relative to vertical list height
-        // constraints
         while (steps < lines && t_item->right) {
           t_item = t_item->right;
           steps++;
@@ -265,6 +263,10 @@ void keypress(struct dmenu_panel *panel, enum wl_keyboard_key_state state,
       } else if (sel && sel->right) {
         currentposition++;
         sel = sel->right;
+      } else if (matches) {
+        // Wrap around to the start of the list
+        sel = matches;
+        currentposition = 0;
       }
     }
     break;
@@ -551,8 +553,7 @@ void draw(cairo_t *cairo, int32_t width, int32_t height, int32_t scale) {
         draw_text(cairo, width, line_height, newtext, &x, &y, &bin, &bin, scale,
                   fg_color, bg_color, item_padding);
       } else {
-        x = prompt_width; // Correct alignment padding relative to prompt width
-                          // bounds
+        x = prompt_width;
         y = (i + 1) * line_height * scale;
         if (y >= height)
           break;
